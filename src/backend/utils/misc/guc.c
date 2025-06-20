@@ -1958,9 +1958,19 @@ static struct config_bool ConfigureNamesBool[] =
 	}
 };
 
-
+extern int block_nested_loop_join_block_size = 1; 
 static struct config_int ConfigureNamesInt[] =
 {
+	{
+        {"bnlj_block_size", PGC_USERSET, QUERY_TUNING_METHOD,
+            gettext_noop("Sets the block size for Block Nested Loop Join."),
+            NULL,
+            GUC_UNIT_BLOCKS
+        },
+        &block_nested_loop_join_block_size,
+        1, 1, 1024, 
+		NULL, NULL, NULL
+    },
 	{
 		{"archive_timeout", PGC_SIGHUP, WAL_ARCHIVING,
 			gettext_noop("Forces a switch to the next WAL file if a "
