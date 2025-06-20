@@ -5,6 +5,12 @@
         "string_view": "c",
         "initializer_list": "c",
         "utility": "c",
-        "tuple": "c"
-    }
+        "tuple": "c",
+        "postgres.h": "c",
+        "stdio.h": "c",
+        "memutils.h": "c"
+    },
+    "editor.formatOnSave": false,
+    "editor.formatOnPaste": false,
+    "editor.formatOnType": false
 }

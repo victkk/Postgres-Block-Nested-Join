@@ -20,13 +20,13 @@
  */
 
 #include "postgres.h"
-
+#include <stdio.h>
 #include "executor/execdebug.h"
 #include "executor/nodeNestloop.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
 
-#define BLOCKSIZE 4
+#define BLOCKSIZE 512
 /* ----------------------------------------------------------------
  *		ExecNestLoop(node)
  *
@@ -102,7 +102,9 @@ ExecNestLoop(PlanState *pstate)
 	 * qualifying join tuple.
 	 */
 	ENL1_printf("entering main loop");
-
+	
+	int i=0;
+	int j=0;
 	for (;;)
 	{
 		/*
@@ -111,75 +113,84 @@ ExecNestLoop(PlanState *pstate)
 		 */
 		if (node->nl_NeedNewOuter)
 		{
-			ENL1_printf("getting new outer tuple");
-			outerTupleSlot = ExecProcNode(outerPlan);
-
-			/*
-			 * if there are no more outer tuples, then the join is complete..
-			 */
-			if (TupIsNull(outerTupleSlot))
-			{
-				ENL1_printf("no outer tuple, ending join");
-				return NULL;
-			}
-
-			ENL1_printf("saving new outer tuple information");
-			econtext->ecxt_outertuple = outerTupleSlot;
-			node->nl_NeedNewOuter = false;
-			node->nl_MatchedOuter = false;
-
-			/*
-			 * now rescan the inner plan
-			 */
-			ENL1_printf("rescanning inner plan");
 			ExecReScan(innerPlan);
+			node->outerBlockSize = 0;
+			node->outerBlockIndex = 0;
+			ENL1_printf("getting new outer tuple");
+			// elog(NOTICE, "getting New Outer");
+			for(;node->outerBlockSize<BLOCKSIZE;node->outerBlockSize++){
+				outerTupleSlot = ExecProcNode(outerPlan);
+				if(!TupIsNull(outerTupleSlot))
+					ExecCopySlot(node->outerBlock[node->outerBlockSize], outerTupleSlot);
+				else
+					break;				
+			}
+			
+			
+			ENL1_printf("saving new outer tuple information");
+			// hack this is probably useful
+			// econtext->ecxt_outertuple = outerTupleSlot;
+			node->nl_NeedNewOuter = false;
 		}
-
-		/*
-		 * we have an outerTuple, try to get the next inner tuple.
-		 */
-		ENL1_printf("getting new inner tuple");
-
-		innerTupleSlot = ExecProcNode(innerPlan);
-		econtext->ecxt_innertuple = innerTupleSlot;
-
-		// after the inner table is traversed, set nl_NeedNewOuter = true for new outer
-		// if is a outer join, specially treat outer tuple if no inner tuple is matched
-		if (TupIsNull(innerTupleSlot))
+		if (node->nl_NeedNewInner)
 		{
-			ENL1_printf("no inner tuple, need new outer tuple");
-
-			node->nl_NeedNewOuter = true;
-			/*
-			 * Otherwise just return to top of loop for a new outer tuple.
-			 */
-			continue;
+			node->innerBlockSize = 0;
+			node->innerBlockIndex = 0;
+			node->outerBlockIndex = 0;
+			for(;node->innerBlockSize<BLOCKSIZE;node->innerBlockSize++){
+				innerTupleSlot = ExecProcNode(innerPlan);
+				if(!TupIsNull(innerTupleSlot))
+					ExecCopySlot(node->innerBlock[node->innerBlockSize], innerTupleSlot);
+				else{
+					break; 
+				}
+			}
+			node->nl_NeedNewInner = false;
 		}
 
-		/*
-		 * at this point we have a new pair of inner and outer tuples so we
-		 * test the inner and outer tuples to see if they satisfy the node's
-		 * qualification.
-		 *
-		 * Only the joinquals determine MatchedOuter status, but all quals
-		 * must pass to actually return the tuple.
-		 */
-		ENL1_printf("testing qualification");
-
-		if (ExecQual(joinqual, econtext))
-		{
-			node->nl_MatchedOuter = true;
-			return ExecProject(node->js.ps.ps_ProjInfo);
+		//	for each r in outer block
+		//		for each s in inner block
+		//			test join condition	
+		for(;node->outerBlockIndex<node->outerBlockSize;node->outerBlockIndex++){
+			// elog(NOTICE, "innerIndex:%d",node->outerBlockIndex);
+			for(;node->innerBlockIndex<node->innerBlockSize;node->innerBlockIndex++){
+				econtext->ecxt_outertuple = node->outerBlock[node->outerBlockIndex];
+				econtext->ecxt_innertuple = node->innerBlock[node->innerBlockIndex];
+				if (ExecQual(joinqual, econtext))
+				{	
+					node->innerBlockIndex++;
+					elog(NOTICE, "join condition satisfied");
+					return ExecProject(node->js.ps.ps_ProjInfo);
+				}
+				else{
+					ResetExprContext(econtext);
+				}
+			}
+			node->innerBlockIndex =0;
 		}
-		else
-			InstrCountFiltered1(node, 1);
+		
 
-		/*
-		 * Tuple fails qual, so free per-tuple memory and try again.
-		 */
-		ResetExprContext(econtext);
+	// new outer/inner block needed and join finish logic
 
-		ENL1_printf("qualification failed, looping");
+		// after the nested for loop a few lines above we definitely need a new inner block
+		node->nl_NeedNewInner =true;
+		// notice: node->innerBlockSize could be zero
+		// if the last innerBlock is not full
+		// then we have traversed through the inner table for current outerBlock
+		// so it's time to start a new outer block(which will also handle the reScan of inner table)
+		if(node->innerBlockSize!=BLOCKSIZE){ 
+			node->nl_NeedNewOuter =true;
+		}
+
+		// if the last outerBlock is not full
+		// then we are at the last outer block
+		// so when the innerBlock is also not full
+		// we know we have traversed throught the inner table for the last block
+		if(node->outerBlockSize!=BLOCKSIZE && node->innerBlockSize!=BLOCKSIZE){
+			elog(NOTICE, "finish since the outerBlockSize does not match BlockSize");
+			elog(NOTICE, "join condition is tested for: %d",i);
+			return NULL;
+		}
 	}
 }
 
@@ -257,13 +268,6 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	case JOIN_INNER:
 	case JOIN_SEMI:
 		break;
-	case JOIN_LEFT:
-	case JOIN_ANTI:
-		nlstate->nl_NullInnerTupleSlot =
-			ExecInitNullTupleSlot(estate,
-								  ExecGetResultType(innerPlanState(nlstate)),
-								  &TTSOpsVirtual);
-		break;
 	default:
 		elog(ERROR, "unrecognized join type: %d",
 			 (int)node->join.jointype);
@@ -273,7 +277,24 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	 * finally, wipe the current outer tuple clean.
 	 */
 	nlstate->nl_NeedNewOuter = true;
-	nlstate->nl_MatchedOuter = false;
+	nlstate->nl_NeedNewInner = true;
+	// 250620 get space for the block(a array of pointer to TupleTableSlot)
+
+	nlstate->outerBlock = (TupleTableSlot **)palloc0fast(BLOCKSIZE * sizeof(TupleTableSlot *));
+	nlstate->innerBlock = (TupleTableSlot **)palloc0fast(BLOCKSIZE * sizeof(TupleTableSlot *));
+	for (int i = 0; i < BLOCKSIZE; i++)
+	{
+		// 为每个元素创建一个独立的、可写的虚拟元组槽
+		nlstate->outerBlock[i] = ExecInitNullTupleSlot(estate, ExecGetResultType(outerPlanState(nlstate)), &TTSOpsVirtual);
+	}
+	for (int i = 0; i < BLOCKSIZE; i++)
+	{
+		nlstate->innerBlock[i] = ExecInitNullTupleSlot(estate, ExecGetResultType(innerPlanState(nlstate)), &TTSOpsVirtual);
+	}
+	nlstate->outerBlockSize = 0;
+	nlstate->innerBlockSize = 0;
+	nlstate->outerBlockIndex = 0;
+	nlstate->innerBlockIndex = 0;
 
 	NL1_printf("ExecInitNestLoop: %s\n",
 			   "node initialized");
@@ -291,7 +312,8 @@ void ExecEndNestLoop(NestLoopState *node)
 {
 	NL1_printf("ExecEndNestLoop: %s\n",
 			   "ending node processing");
-
+	pfree(node->outerBlock);
+	pfree(node->innerBlock);
 	/*
 	 * Free the exprcontext
 	 */
@@ -334,5 +356,4 @@ void ExecReScanNestLoop(NestLoopState *node)
 	 */
 
 	node->nl_NeedNewOuter = true;
-	node->nl_MatchedOuter = false;
 }
