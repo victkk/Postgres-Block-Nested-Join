@@ -26,7 +26,7 @@
 #include "miscadmin.h"
 #include "utils/memutils.h"
 
-
+#define BLOCKSIZE 4
 /* ----------------------------------------------------------------
  *		ExecNestLoop(node)
  *
@@ -60,16 +60,22 @@
 static TupleTableSlot *
 ExecNestLoop(PlanState *pstate)
 {
+	// you need to understand this trick to use inheritance in C to understand the typecast
+	// the passed in PlanState *pstate is actually a pointer to a NestLoopState
+	// the reason that you can visit the attribute of PlanState as you normally could
+	// is that PlanState is the first attribute of Struct JoinState which is in turn
+	// the first attribute of Struct NestLoopState
+	// so the head of the NestLoopState is organized just like a PlanState
 	NestLoopState *node = castNode(NestLoopState, pstate);
-	NestLoop   *nl;
-	PlanState  *innerPlan;
-	PlanState  *outerPlan;
+	NestLoop *nl;
+	PlanState *innerPlan;
+	PlanState *outerPlan;
 	TupleTableSlot *outerTupleSlot;
 	TupleTableSlot *innerTupleSlot;
-	ExprState  *joinqual;
-	ExprState  *otherqual;
+	ExprState *joinqual;
+	ExprState *otherqual;
 	ExprContext *econtext;
-	ListCell   *lc;
+	ListCell *lc;
 
 	CHECK_FOR_INTERRUPTS();
 
@@ -78,7 +84,7 @@ ExecNestLoop(PlanState *pstate)
 	 */
 	ENL1_printf("getting info from node");
 
-	nl = (NestLoop *) node->js.ps.plan;
+	nl = (NestLoop *)node->js.ps.plan;
 	joinqual = node->js.joinqual;
 	otherqual = node->js.ps.qual;
 	outerPlan = outerPlanState(node);
@@ -123,29 +129,6 @@ ExecNestLoop(PlanState *pstate)
 			node->nl_MatchedOuter = false;
 
 			/*
-			 * fetch the values of any outer Vars that must be passed to the
-			 * inner scan, and store them in the appropriate PARAM_EXEC slots.
-			 */
-			foreach(lc, nl->nestParams)
-			{
-				NestLoopParam *nlp = (NestLoopParam *) lfirst(lc);
-				int			paramno = nlp->paramno;
-				ParamExecData *prm;
-
-				prm = &(econtext->ecxt_param_exec_vals[paramno]);
-				/* Param value should be an OUTER_VAR var */
-				Assert(IsA(nlp->paramval, Var));
-				Assert(nlp->paramval->varno == OUTER_VAR);
-				Assert(nlp->paramval->varattno > 0);
-				prm->value = slot_getattr(outerTupleSlot,
-										  nlp->paramval->varattno,
-										  &(prm->isnull));
-				/* Flag parameter value as changed */
-				innerPlan->chgParam = bms_add_member(innerPlan->chgParam,
-													 paramno);
-			}
-
-			/*
 			 * now rescan the inner plan
 			 */
 			ENL1_printf("rescanning inner plan");
@@ -160,41 +143,13 @@ ExecNestLoop(PlanState *pstate)
 		innerTupleSlot = ExecProcNode(innerPlan);
 		econtext->ecxt_innertuple = innerTupleSlot;
 
+		// after the inner table is traversed, set nl_NeedNewOuter = true for new outer
+		// if is a outer join, specially treat outer tuple if no inner tuple is matched
 		if (TupIsNull(innerTupleSlot))
 		{
 			ENL1_printf("no inner tuple, need new outer tuple");
 
 			node->nl_NeedNewOuter = true;
-
-			if (!node->nl_MatchedOuter &&
-				(node->js.jointype == JOIN_LEFT ||
-				 node->js.jointype == JOIN_ANTI))
-			{
-				/*
-				 * We are doing an outer join and there were no join matches
-				 * for this outer tuple.  Generate a fake join tuple with
-				 * nulls for the inner tuple, and return it if it passes the
-				 * non-join quals.
-				 */
-				econtext->ecxt_innertuple = node->nl_NullInnerTupleSlot;
-
-				ENL1_printf("testing qualification for outer-join tuple");
-
-				if (otherqual == NULL || ExecQual(otherqual, econtext))
-				{
-					/*
-					 * qualification was satisfied so we project and return
-					 * the slot containing the result tuple using
-					 * ExecProject().
-					 */
-					ENL1_printf("qualification succeeded, projecting tuple");
-
-					return ExecProject(node->js.ps.ps_ProjInfo);
-				}
-				else
-					InstrCountFiltered2(node, 1);
-			}
-
 			/*
 			 * Otherwise just return to top of loop for a new outer tuple.
 			 */
@@ -214,34 +169,7 @@ ExecNestLoop(PlanState *pstate)
 		if (ExecQual(joinqual, econtext))
 		{
 			node->nl_MatchedOuter = true;
-
-			/* In an antijoin, we never return a matched tuple */
-			if (node->js.jointype == JOIN_ANTI)
-			{
-				node->nl_NeedNewOuter = true;
-				continue;		/* return to top of loop */
-			}
-
-			/*
-			 * If we only need to join to the first matching inner tuple, then
-			 * consider returning this one, but after that continue with next
-			 * outer tuple.
-			 */
-			if (node->js.single_match)
-				node->nl_NeedNewOuter = true;
-
-			if (otherqual == NULL || ExecQual(otherqual, econtext))
-			{
-				/*
-				 * qualification was satisfied so we project and return the
-				 * slot containing the result tuple using ExecProject().
-				 */
-				ENL1_printf("qualification succeeded, projecting tuple");
-
-				return ExecProject(node->js.ps.ps_ProjInfo);
-			}
-			else
-				InstrCountFiltered2(node, 1);
+			return ExecProject(node->js.ps.ps_ProjInfo);
 		}
 		else
 			InstrCountFiltered1(node, 1);
@@ -273,8 +201,9 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	/*
 	 * create state structure
 	 */
+	// just like new in C++
 	nlstate = makeNode(NestLoopState);
-	nlstate->js.ps.plan = (Plan *) node;
+	nlstate->js.ps.plan = (Plan *)node;
 	nlstate->js.ps.state = estate;
 	nlstate->js.ps.ExecProcNode = ExecNestLoop;
 
@@ -311,10 +240,10 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	 * initialize child expressions
 	 */
 	nlstate->js.ps.qual =
-		ExecInitQual(node->join.plan.qual, (PlanState *) nlstate);
+		ExecInitQual(node->join.plan.qual, (PlanState *)nlstate);
 	nlstate->js.jointype = node->join.jointype;
 	nlstate->js.joinqual =
-		ExecInitQual(node->join.joinqual, (PlanState *) nlstate);
+		ExecInitQual(node->join.joinqual, (PlanState *)nlstate);
 
 	/*
 	 * detect whether we need only consider the first matching inner tuple
@@ -325,19 +254,19 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	/* set up null tuples for outer joins, if needed */
 	switch (node->join.jointype)
 	{
-		case JOIN_INNER:
-		case JOIN_SEMI:
-			break;
-		case JOIN_LEFT:
-		case JOIN_ANTI:
-			nlstate->nl_NullInnerTupleSlot =
-				ExecInitNullTupleSlot(estate,
-									  ExecGetResultType(innerPlanState(nlstate)),
-									  &TTSOpsVirtual);
-			break;
-		default:
-			elog(ERROR, "unrecognized join type: %d",
-				 (int) node->join.jointype);
+	case JOIN_INNER:
+	case JOIN_SEMI:
+		break;
+	case JOIN_LEFT:
+	case JOIN_ANTI:
+		nlstate->nl_NullInnerTupleSlot =
+			ExecInitNullTupleSlot(estate,
+								  ExecGetResultType(innerPlanState(nlstate)),
+								  &TTSOpsVirtual);
+		break;
+	default:
+		elog(ERROR, "unrecognized join type: %d",
+			 (int)node->join.jointype);
 	}
 
 	/*
@@ -358,8 +287,7 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
  *		closes down scans and frees allocated storage
  * ----------------------------------------------------------------
  */
-void
-ExecEndNestLoop(NestLoopState *node)
+void ExecEndNestLoop(NestLoopState *node)
 {
 	NL1_printf("ExecEndNestLoop: %s\n",
 			   "ending node processing");
@@ -388,10 +316,9 @@ ExecEndNestLoop(NestLoopState *node)
  *		ExecReScanNestLoop
  * ----------------------------------------------------------------
  */
-void
-ExecReScanNestLoop(NestLoopState *node)
+void ExecReScanNestLoop(NestLoopState *node)
 {
-	PlanState  *outerPlan = outerPlanState(node);
+	PlanState *outerPlan = outerPlanState(node);
 
 	/*
 	 * If outerPlan->chgParam is not null then plan will be automatically
