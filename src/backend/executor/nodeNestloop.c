@@ -26,7 +26,7 @@
 #include "miscadmin.h"
 #include "utils/memutils.h"
 
-#define BLOCKSIZE 512
+#include "../include/postmaster/bgworker.h"
 /* ----------------------------------------------------------------
  *		ExecNestLoop(node)
  *
@@ -118,7 +118,7 @@ ExecNestLoop(PlanState *pstate)
 			node->outerBlockIndex = 0;
 			ENL1_printf("getting new outer tuple");
 			// elog(NOTICE, "getting New Outer");
-			for(;node->outerBlockSize<BLOCKSIZE;node->outerBlockSize++){
+			for(;node->outerBlockSize<block_nested_loop_join_block_size;node->outerBlockSize++){
 				outerTupleSlot = ExecProcNode(outerPlan);
 				if(!TupIsNull(outerTupleSlot))
 					ExecCopySlot(node->outerBlock[node->outerBlockSize], outerTupleSlot);
@@ -137,7 +137,7 @@ ExecNestLoop(PlanState *pstate)
 			node->innerBlockSize = 0;
 			node->innerBlockIndex = 0;
 			node->outerBlockIndex = 0;
-			for(;node->innerBlockSize<BLOCKSIZE;node->innerBlockSize++){
+			for(;node->innerBlockSize<block_nested_loop_join_block_size;node->innerBlockSize++){
 				innerTupleSlot = ExecProcNode(innerPlan);
 				if(!TupIsNull(innerTupleSlot))
 					ExecCopySlot(node->innerBlock[node->innerBlockSize], innerTupleSlot);
@@ -159,7 +159,7 @@ ExecNestLoop(PlanState *pstate)
 				if (ExecQual(joinqual, econtext))
 				{	
 					node->innerBlockIndex++;
-					elog(NOTICE, "join condition satisfied");
+					// elog(NOTICE, "join condition satisfied");
 					return ExecProject(node->js.ps.ps_ProjInfo);
 				}
 				else{
@@ -178,7 +178,7 @@ ExecNestLoop(PlanState *pstate)
 		// if the last innerBlock is not full
 		// then we have traversed through the inner table for current outerBlock
 		// so it's time to start a new outer block(which will also handle the reScan of inner table)
-		if(node->innerBlockSize!=BLOCKSIZE){ 
+		if(node->innerBlockSize!=block_nested_loop_join_block_size){ 
 			node->nl_NeedNewOuter =true;
 		}
 
@@ -186,9 +186,8 @@ ExecNestLoop(PlanState *pstate)
 		// then we are at the last outer block
 		// so when the innerBlock is also not full
 		// we know we have traversed throught the inner table for the last block
-		if(node->outerBlockSize!=BLOCKSIZE && node->innerBlockSize!=BLOCKSIZE){
-			elog(NOTICE, "finish since the outerBlockSize does not match BlockSize");
-			elog(NOTICE, "join condition is tested for: %d",i);
+		if(node->outerBlockSize!=block_nested_loop_join_block_size && node->innerBlockSize!=block_nested_loop_join_block_size){
+			// elog(NOTICE, "finish since both inner and outerBlockSize does not match BlockSize");
 			return NULL;
 		}
 	}
@@ -201,6 +200,9 @@ ExecNestLoop(PlanState *pstate)
 NestLoopState *
 ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 {
+	elog(INFO, "\033[31mUSING SELF-IMPLEMENTED BLOCK NESTED JOIN!\033[0m");	
+	elog(INFO, "\033[31mBLOCK SIZE:%d\033[0m",block_nested_loop_join_block_size);
+	elog(INFO, "\033[34mUse 'set bnlj_block_size = $BLOCK_SIZE;' to set block size\033[0m");		
 	NestLoopState *nlstate;
 
 	/* check for unsupported flags */
@@ -280,14 +282,14 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	nlstate->nl_NeedNewInner = true;
 	// 250620 get space for the block(a array of pointer to TupleTableSlot)
 
-	nlstate->outerBlock = (TupleTableSlot **)palloc0fast(BLOCKSIZE * sizeof(TupleTableSlot *));
-	nlstate->innerBlock = (TupleTableSlot **)palloc0fast(BLOCKSIZE * sizeof(TupleTableSlot *));
-	for (int i = 0; i < BLOCKSIZE; i++)
+	nlstate->outerBlock = (TupleTableSlot **)palloc0fast(block_nested_loop_join_block_size * sizeof(TupleTableSlot *));
+	nlstate->innerBlock = (TupleTableSlot **)palloc0fast(block_nested_loop_join_block_size * sizeof(TupleTableSlot *));
+	for (int i = 0; i < block_nested_loop_join_block_size; i++)
 	{
 		// 为每个元素创建一个独立的、可写的虚拟元组槽
 		nlstate->outerBlock[i] = ExecInitNullTupleSlot(estate, ExecGetResultType(outerPlanState(nlstate)), &TTSOpsVirtual);
 	}
-	for (int i = 0; i < BLOCKSIZE; i++)
+	for (int i = 0; i < block_nested_loop_join_block_size; i++)
 	{
 		nlstate->innerBlock[i] = ExecInitNullTupleSlot(estate, ExecGetResultType(innerPlanState(nlstate)), &TTSOpsVirtual);
 	}
