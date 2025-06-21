@@ -1,4 +1,4 @@
-# PostgreSQL块嵌套循环连接(BNLJ)实现
+# 复旦大学数据库期末PJ-Postgre块嵌套循环连接(BNLJ)实现
 
 ## 项目概述
 
